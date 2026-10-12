@@ -1,32 +1,44 @@
-# React + TypeScript + Vite
+# DataLab Workbench
 
-This template provides a minimal setup to get React working in Vite with HMR and some Oxlint rules.
+An early, local-first prototype of a no-code data workbench. The current slice supports importing and inspecting small CSV/TSV files, applying basic table changes, and checking simple prediction baselines. Imported data is processed in the browser and is not uploaded by the app.
 
-Currently, two official plugins are available:
+## Run locally
 
-- [@vitejs/plugin-react](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react) uses [Oxc](https://oxc.rs)
-- [@vitejs/plugin-react-swc](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react-swc) uses [SWC](https://swc.rs/)
+Requires Node.js 24 or later.
 
-## React Compiler
-
-The React Compiler is not enabled on this template because of its impact on dev & build performances. To add it, see [this documentation](https://react.dev/learn/react-compiler/installation).
-
-## Expanding the Oxlint configuration
-
-If you are developing a production application, we recommend enabling type-aware lint rules by installing `oxlint-tsgolint` and editing `.oxlintrc.json`:
-
-```json
-{
-  "$schema": "./node_modules/oxlint/configuration_schema.json",
-  "plugins": ["react", "typescript", "oxc"],
-  "options": {
-    "typeAware": true
-  },
-  "rules": {
-    "react/rules-of-hooks": "error",
-    "react/only-export-components": ["warn", { "allowConstantExport": true }]
-  }
-}
+```sh
+npm install
+npm run dev
 ```
 
-See the [Oxlint rules documentation](https://oxc.rs/docs/guide/usage/linter/rules) for the full list of rules and categories.
+## Checks
+
+```sh
+npm test
+npm run lint
+npm run build
+```
+
+Tests use Node's built-in test runner and TypeScript type stripping; no test framework dependency is required.
+
+## Current scope
+
+- CSV and TSV import with quoted-field parsing, UTF-8 BOM handling, duplicate-header normalization, and input validation.
+- Local previews (up to 8 rows), column profiles, missing-value counts, and duplicate-row counts.
+- In-memory column rename, missing-value fill, column removal, row filters, restore-to-imported-source, and CSV export.
+- Local bar and donut visualizations with configurable grouping and sum, mean, or row-count aggregation.
+- Simple mean regression and majority-class baselines using the first 80% of rows for training and the remainder for testing.
+
+## Prototype limits
+
+- Files are limited to 25 MiB, 50,000 rows, 100 columns, and 32,000 characters per cell.
+- Excel, Parquet, database/object-store connectors, persistence, authentication, APIs, server execution, trained ML models, and distributed processing are not implemented.
+- Baseline evaluation is a diagnostic constant predictor, not a trained model or a claim of production model quality.
+- Data is held in memory; reloading the page clears the current session. Export a prepared CSV to keep a copy.
+- This prototype does not provide the approved security foundation for hosted team access or connector credentials. Do not enter secrets or sensitive datasets.
+
+## Performance check
+
+Run `npm run benchmark` to generate a deterministic CSV at the current 50,000-row ceiling and measure median parse, profile, filter, group aggregation, and filtered export time after warm-up. Results depend on the machine and runtime. This does not measure browser rendering, 100+ GB data, connector pushdown, or distributed execution.
+
+The broader product requirements and open decisions are recorded in `.azure/project-plan.md`. This prototype implements only a bounded local/offline slice and does not imply that the full workbench or 100+ GB support is available.

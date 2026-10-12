@@ -28,6 +28,8 @@ export type TableProfile = {
 }
 
 export type FilterOperator = 'equals' | 'contains' | 'greater' | 'less' | 'empty' | 'not-empty'
+export type Aggregation = 'sum' | 'mean' | 'count'
+export type AggregatePoint = { group: string; value: number; records: number }
 
 export type BaselineEvaluation = {
   task: 'regression' | 'classification'
@@ -154,14 +156,52 @@ export function filterRows(
     switch (operator) {
       case 'equals': return value === operand
       case 'contains': return value.toLocaleLowerCase().includes(operand.toLocaleLowerCase())
-      case 'greater': return operand.trim() !== '' && Number.isFinite(Number(value)) && Number(value) > numericOperand
-      case 'less': return operand.trim() !== '' && Number.isFinite(Number(value)) && Number(value) < numericOperand
+      case 'greater': return operand.trim() !== '' && value.trim() !== '' && Number.isFinite(Number(value)) && Number(value) > numericOperand
+      case 'less': return operand.trim() !== '' && value.trim() !== '' && Number.isFinite(Number(value)) && Number(value) < numericOperand
       case 'empty': return value.trim() === ''
       case 'not-empty': return value.trim() !== ''
     }
   })
 
   return { ...table, rows }
+}
+
+export function aggregateBy(
+  table: DataTable,
+  groupColumn: string,
+  valueColumn: string,
+  aggregation: Aggregation,
+  limit = 12,
+): AggregatePoint[] {
+  const groupIndex = table.columns.indexOf(groupColumn)
+  const valueIndex = table.columns.indexOf(valueColumn)
+  if (groupIndex < 0) throw new Error('Choose a grouping column that exists in the current dataset.')
+  if (aggregation !== 'count' && valueIndex < 0) throw new Error('Choose a value column that exists in the current dataset.')
+  if (!Number.isInteger(limit) || limit < 1) throw new Error('The chart limit must be a positive whole number.')
+
+  const groups = new Map<string, { sum: number; records: number }>()
+  for (const row of table.rows) {
+    const group = row[groupIndex]?.trim() || '(Missing)'
+    const current = groups.get(group) ?? { sum: 0, records: 0 }
+    if (aggregation === 'count') {
+      current.records += 1
+    } else {
+      const rawValue = row[valueIndex]?.trim() ?? ''
+      if (rawValue === '' || !Number.isFinite(Number(rawValue))) continue
+      current.sum += Number(rawValue)
+      current.records += 1
+    }
+    groups.set(group, current)
+  }
+
+  return [...groups.entries()]
+    .map(([group, values]) => ({
+      group,
+      records: values.records,
+      value: aggregation === 'count' ? values.records : aggregation === 'mean' ? values.sum / values.records : values.sum,
+    }))
+    .sort((left, right) => right.value - left.value || left.group.localeCompare(right.group))
+    .slice(0, limit)
 }
 
 export function renameColumn(table: DataTable, currentName: string, nextName: string): DataTable {
@@ -248,6 +288,12 @@ export function evaluateBaseline(
 
 export function formatBytes(bytes: number): string {
   return `${(bytes / (1024 * 1024)).toFixed(0)} MiB`
+}
+
+export function serializeCsv(table: DataTable): string {
+  return [table.columns, ...table.rows]
+    .map((row) => row.map((value) => `"${value.replaceAll('"', '""')}"`).join(','))
+    .join('\r\n')
 }
 
 function pushField(record: string[], value: string): void {
