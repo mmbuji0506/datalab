@@ -1,11 +1,16 @@
 import { performance } from 'node:perf_hooks'
 import {
   MAX_IMPORT_BYTES,
+  MAX_IMPORT_COLUMNS,
   MAX_IMPORT_ROWS,
   aggregateBy,
+  evaluateBaseline,
+  fillMissing,
   filterRows,
   parseDelimitedFile,
   profileTable,
+  removeColumn,
+  renameColumn,
   serializeCsv,
 } from '../src/workbench.ts'
 
@@ -42,6 +47,43 @@ const filtered = measure(() => filterRows(parsed.result, 'region', 'equals', 'Re
 const aggregated = measure(() => aggregateBy(parsed.result, 'region', 'revenue', 'sum'))
 const highCardinality = measure(() => aggregateBy(parsed.result, 'id', 'revenue', 'sum'))
 const exported = measure(() => serializeCsv(filtered.result))
+const prepared = measure(() => removeColumn(
+  renameColumn(fillMissing(parsed.result, 'sessions', '0'), 'week', 'period'),
+  'id',
+))
+const regression = measure(() => evaluateBaseline(parsed.result, 'revenue', 'regression'))
+
+function quote(value) {
+  return `"${String(value).replaceAll('"', '""')}"`
+}
+
+const dirtyHeaders = ['record_id', 'region', 'class', 'amount', 'note']
+const dirtyRows = Array.from({ length: 20_000 }, (_, index) => {
+  const sourceIndex = index % 200 === 199 ? index - 1 : index
+    const region = ['Nord, coast', 'South', 'East', 'West'][sourceIndex % 4]
+  const label = sourceIndex % 3 === 0 ? 'positive' : 'negative'
+  const amount = sourceIndex % 13 === 0 ? '' : String((sourceIndex * 19) % 10_000)
+  const note = sourceIndex % 53 === 0 ? 'quoted, "review"\nsecond line' : 'standard'
+  return [sourceIndex % 19_500, region, label, amount, note].map(quote).join(',')
+})
+const dirtyContents = [dirtyHeaders.map(quote).join(','), ...dirtyRows].join('\r\n')
+const dirtyBytes = Buffer.byteLength(dirtyContents)
+if (dirtyBytes > MAX_IMPORT_BYTES) throw new Error('Dirty fixture exceeds the supported import byte ceiling.')
+const dirtyParsed = measure(() => parseDelimitedFile(dirtyContents, 'dirty-mixed.csv'))
+const dirtyProfile = measure(() => profileTable(dirtyParsed.result))
+const dirtyFilled = fillMissing(dirtyParsed.result, 'amount', '0')
+const dirtyPrepared = measure(() => filterRows(dirtyFilled, 'region', 'contains', 'o'))
+const dirtyClassification = measure(() => evaluateBaseline(dirtyParsed.result, 'class', 'classification'))
+
+const wideHeaders = Array.from({ length: MAX_IMPORT_COLUMNS }, (_, index) => `feature_${index + 1}`)
+const wideRows = Array.from({ length: 2_500 }, (_, rowIndex) =>
+  wideHeaders.map((_, columnIndex) => String((rowIndex * (columnIndex + 3)) % 100_003)).join(','),
+)
+const wideContents = [wideHeaders.join(','), ...wideRows].join('\n')
+const wideBytes = Buffer.byteLength(wideContents)
+if (wideBytes > MAX_IMPORT_BYTES) throw new Error('Wide fixture exceeds the supported import byte ceiling.')
+const wideParsed = measure(() => parseDelimitedFile(wideContents, 'wide-100-columns.csv'))
+const wideProfile = measure(() => profileTable(wideParsed.result))
 
 console.log(JSON.stringify({
   fixture: {
@@ -51,6 +93,19 @@ console.log(JSON.stringify({
     limitBytes: MAX_IMPORT_BYTES,
     rowLimit: MAX_IMPORT_ROWS,
   },
+  dirtyFixture: {
+    rows: dirtyParsed.result.rows.length,
+    columns: dirtyParsed.result.columns.length,
+    bytes: dirtyBytes,
+    duplicateRows: dirtyProfile.result.duplicateRows,
+    missingAmountCells: dirtyProfile.result.columns.find((column) => column.name === 'amount').missing,
+    processedRows: dirtyPrepared.result.rows.length,
+  },
+  wideFixture: {
+    rows: wideParsed.result.rows.length,
+    columns: wideParsed.result.columns.length,
+    bytes: wideBytes,
+  },
   timingsMs: {
     parseMedian: parsed.medianMs,
     profileMedian: profiled.medianMs,
@@ -58,10 +113,19 @@ console.log(JSON.stringify({
     aggregateMedian: aggregated.medianMs,
     highCardinalityAggregateMedian: highCardinality.medianMs,
     exportFilteredRowsMedian: exported.medianMs,
+    fullPrepareMedian: prepared.medianMs,
+    regressionEvaluationMedian: regression.medianMs,
+    dirtyParseMedian: dirtyParsed.medianMs,
+    dirtyProfileMedian: dirtyProfile.medianMs,
+    dirtyFillFilterMedian: dirtyPrepared.medianMs,
+    dirtyClassificationMedian: dirtyClassification.medianMs,
+    wideParseMedian: wideParsed.medianMs,
+    wideProfileMedian: wideProfile.medianMs,
   },
   iterationsPerOperation: parsed.iterations,
   filteredRows: filtered.result.rows.length,
   chartGroups: aggregated.result.length,
   highCardinalityGroupsExamined: MAX_IMPORT_ROWS,
   exportedBytes: Buffer.byteLength(exported.result),
+  warmupAndIterationsPerOperation: parsed.iterations,
 }, null, 2))

@@ -39,6 +39,6 @@ Tests use Node's built-in test runner and TypeScript type stripping; no test fra
 
 ## Performance check
 
-Run `npm run benchmark` to generate a deterministic CSV at the current 50,000-row ceiling and measure median parse, profile, filter, group aggregation, and filtered export time after warm-up. Results depend on the machine and runtime. This does not measure browser rendering, 100+ GB data, connector pushdown, or distributed execution.
+Run `npm run benchmark` to exercise a deterministic dataset matrix: 50,000 mixed rows, 20,000 dirty rows with duplicates/missing values/quoted text, and a 2,500-row by 100-column wide table. It measures median parse, profile, fill/filter, transforms, aggregation (including 50,000 unique groups), regression/classification baseline evaluation, and export after warm-up. Results depend on the machine and runtime. This does not measure 100+ GB data, connector pushdown, or distributed execution.
 
 The broader product requirements and open decisions are recorded in `.azure/project-plan.md`. This prototype implements only a bounded local/offline slice and does not imply that the full workbench or 100+ GB support is available.
