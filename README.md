@@ -25,8 +25,10 @@ Tests use Node's built-in test runner and TypeScript type stripping; no test fra
 
 - CSV and TSV import with quoted-field parsing, UTF-8 BOM handling, duplicate-header normalization, and input validation.
 - Local previews (up to 8 rows), column profiles, missing-value counts, and duplicate-row counts.
-- In-memory column rename, missing-value fill, column removal, row filters, restore-to-imported-source, and CSV export.
+- In-memory column rename, missing-value fill/drop, whitespace trim, exact-row deduplication, column removal, min-max/z-score normalization, row filters, restore-to-imported-source, and CSV export.
 - Local bar and donut visualizations with configurable grouping and sum, mean, or row-count aggregation.
+- Pairwise Pearson correlation for up to eight numeric columns, including complete-pair sample counts and explicit undefined results for constant columns.
+- Local CSV/TSV append with case-insensitive schema alignment, and inner/left joins with duplicate-key expansion and output limits.
 - Simple mean regression and majority-class baselines using the first 80% of rows for training and the remainder for testing.
 
 ## Prototype limits
@@ -39,6 +41,6 @@ Tests use Node's built-in test runner and TypeScript type stripping; no test fra
 
 ## Performance check
 
-Run `npm run benchmark` to exercise a deterministic dataset matrix: 50,000 mixed rows, 20,000 dirty rows with duplicates/missing values/quoted text, and a 2,500-row by 100-column wide table. It measures median parse, profile, fill/filter, transforms, aggregation (including 50,000 unique groups), regression/classification baseline evaluation, and export after warm-up. Results depend on the machine and runtime. This does not measure 100+ GB data, connector pushdown, or distributed execution.
+Run `npm run benchmark` to exercise a deterministic dataset matrix: 50,000 mixed rows, 20,000 dirty rows with duplicates/missing values/quoted text, and a 2,500-row by 100-column wide table. It measures median parse, profile, cleaning, normalization, filter, aggregation (including 50,000 unique groups), correlation, 50,000-row join/append, regression/classification baseline evaluation, and export after warm-up. Results depend on the machine and runtime. This does not measure 100+ GB data, connector pushdown, or distributed execution.
 
 The broader product requirements and open decisions are recorded in `.azure/project-plan.md`. This prototype implements only a bounded local/offline slice and does not imply that the full workbench or 100+ GB support is available.
