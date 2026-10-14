@@ -1,13 +1,15 @@
 import { BarChart3, Calculator } from "lucide-react";
-import type { CorrelationMatrix } from "./workbench";
+import type { CorrelationMethod, CorrelationResult } from "./analytics.ts";
 
 type CorrelationPanelProps = {
   numericColumns: string[];
   selectedColumns: string[];
-  matrix: CorrelationMatrix | null;
+  matrix: CorrelationResult | null;
+  method: CorrelationMethod;
   error: string;
   maxColumns: number;
   onSelectionChange: (columns: string[]) => void;
+  onMethodChange: (method: CorrelationMethod) => void;
   onCalculate: () => void;
 };
 
@@ -15,9 +17,11 @@ export function CorrelationPanel({
   numericColumns,
   selectedColumns,
   matrix,
+  method,
   error,
   maxColumns,
   onSelectionChange,
+  onMethodChange,
   onCalculate,
 }: CorrelationPanelProps) {
   function toggleColumn(column: string, checked: boolean) {
@@ -45,8 +49,11 @@ export function CorrelationPanel({
         </span>
       </div>
       <p className="correlation-description">
-        Pearson correlation on complete pairs. It describes linear association,
-        not causation.
+        {method === "pearson"
+          ? "Pearson correlation on complete pairs measures linear association."
+          : "Spearman rank correlation on complete pairs measures whether values rise together, even along a curve, and resists outliers."}{" "}
+        Neither shows causation. p-values test whether a relationship could be chance; with many pairs, a few will look
+        significant by luck.
       </p>
       {numericColumns.length >= 2 ? (
         <>
@@ -71,6 +78,19 @@ export function CorrelationPanel({
                 </label>
               );
             })}
+          </div>
+          <div className="correlation-method" role="group" aria-label="Correlation method">
+            {(["pearson", "spearman"] as const).map((option) => (
+              <label key={option} className={method === option ? "checked" : undefined}>
+                <input
+                  type="radio"
+                  name="correlation-method"
+                  checked={method === option}
+                  onChange={() => onMethodChange(option)}
+                />
+                <span>{option === "pearson" ? "Pearson (linear)" : "Spearman (rank)"}</span>
+              </label>
+            ))}
           </div>
           <div className="correlation-actions">
             <button
@@ -107,10 +127,11 @@ export function CorrelationPanel({
                         const coefficient =
                           matrix.values[rowIndex][columnIndex];
                         const pairs = matrix.counts[rowIndex][columnIndex];
+                        const pValue = matrix.pValues[rowIndex][columnIndex];
                         return (
                           <td
                             key={column}
-                            title={`${pairs.toLocaleString()} complete row pairs`}
+                            title={`${pairs.toLocaleString()} complete row pairs${pValue === null || rowIndex === columnIndex ? "" : `, ${describeP(pValue)}`}`}
                           >
                             {coefficient === null ? (
                               <span className="undefined-correlation">N/A</span>
@@ -125,7 +146,10 @@ export function CorrelationPanel({
                                 {coefficient.toFixed(2)}
                               </span>
                             )}
-                            <small>{pairs.toLocaleString()} rows</small>
+                            <small>
+                              {pairs.toLocaleString()} rows
+                              {rowIndex !== columnIndex && pValue !== null && ` · ${describeP(pValue)}`}
+                            </small>
                           </td>
                         );
                       })}
@@ -143,6 +167,10 @@ export function CorrelationPanel({
       )}
     </section>
   );
+}
+
+function describeP(value: number): string {
+  return value < 0.001 ? "p < 0.001" : `p = ${value.toFixed(3)}`;
 }
 
 function correlationColor(value: number): string {

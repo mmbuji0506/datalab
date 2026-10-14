@@ -20,6 +20,17 @@ import {
   serializeCsv,
   trimTextColumn,
 } from "../src/workbench.ts";
+import {
+  analyzeTable,
+  assessQuality,
+  correlate,
+  imputeColumn,
+  oneHotEncode,
+  treatOutliers,
+} from "../src/analytics.ts";
+import { kmeans, scanClusterCounts } from "../src/clustering.ts";
+import { runModel } from "../src/models.ts";
+import { replayRecipe } from "../src/recipe.ts";
 
 const headers = ["id", "week", "region", "sessions", "orders", "revenue"];
 const rows = Array.from({ length: MAX_IMPORT_ROWS }, (_, index) => {
@@ -185,6 +196,33 @@ const wideParsed = measure(() =>
 );
 const wideProfile = measure(() => profileTable(wideParsed.result));
 
+// --- Analytics, recipe replay, models, and clustering at the same 50,000-row scale ---
+const analyzed = measure(() => analyzeTable(parsed.result), 3);
+const assessed = measure(() => assessQuality(parsed.result, analyzed.result), 3);
+const wideAnalyzed = measure(() => analyzeTable(wideParsed.result), 3);
+const spearman = measure(() => correlate(parsed.result, ["sessions", "orders", "revenue"], "spearman"), 3);
+const imputed = measure(() => imputeColumn(parsed.result, "sessions", "median"), 3);
+const outlierCapped = measure(() => treatOutliers(parsed.result, "revenue", "cap"), 3);
+const oneHot = measure(() => oneHotEncode(parsed.result, "region"), 3);
+const replaySteps = [
+  { op: "impute", column: "sessions", strategy: "median" },
+  { op: "outliers", column: "revenue", method: "cap" },
+  { op: "normalize", column: "orders", method: "z-score" },
+  { op: "one-hot", column: "region" },
+  { op: "remove-column", column: "week" },
+];
+const replayed = measure(() => replayRecipe(parsed.result, replaySteps), 3);
+const modelRows = parsed.result.rows.map((row) => [row[3] === "" ? "0" : row[3], row[4], row[2], row[5]]);
+const modelTable = { sourceName: "model.csv", columns: ["sessions", "orders", "region", "revenue"], rows: modelRows };
+const baseConfig = { testFraction: 0.2, seed: 42, split: "random", folds: 0 };
+const ridgeRun = measure(() => runModel(modelTable, { ...baseConfig, target: "revenue", task: "regression", model: "linear", features: ["sessions", "orders", "region"] }), 1);
+const ridgeCvRun = measure(() => runModel(modelTable, { ...baseConfig, folds: 5, target: "revenue", task: "regression", model: "linear", features: ["sessions", "orders", "region"] }), 1);
+const treeRun = measure(() => runModel(modelTable, { ...baseConfig, target: "revenue", task: "regression", model: "tree", features: ["sessions", "orders", "region"] }), 1);
+const classTable = { sourceName: "class.csv", columns: ["sessions", "orders", "region", "tier"], rows: modelRows.map((row) => [row[0], row[1], row[2], Number(row[3]) > 3000 ? "high" : Number(row[3]) > 1500 ? "mid" : "low"]) };
+const logisticRun = measure(() => runModel(classTable, { ...baseConfig, target: "tier", task: "classification", model: "linear", features: ["sessions", "orders", "region"] }), 1);
+const kmeansRun = measure(() => kmeans(modelTable, ["sessions", "orders", "revenue"], 4, 42), 1);
+const scanRun = measure(() => scanClusterCounts(modelTable, ["sessions", "orders", "revenue"], 42), 1);
+
 console.log(
   JSON.stringify(
     {
@@ -240,7 +278,22 @@ console.log(
         dirtyClassificationMedian: dirtyClassification.medianMs,
         wideParseMedian: wideParsed.medianMs,
         wideProfileMedian: wideProfile.medianMs,
+        analyzeTable50kMedian: analyzed.medianMs,
+        assessQuality50kMedian: assessed.medianMs,
+        analyzeTableWide100ColumnsMedian: wideAnalyzed.medianMs,
+        spearmanCorrelation50kMedian: spearman.medianMs,
+        imputeMedian50kMedian: imputed.medianMs,
+        outlierCap50kMedian: outlierCapped.medianMs,
+        oneHot50kMedian: oneHot.medianMs,
+        replayFiveSteps50kMedian: replayed.medianMs,
+        "ridgeTrainAndTest20kSampleMs": ridgeRun.medianMs,
+        "ridgeWith5FoldCvMs": ridgeCvRun.medianMs,
+        "decisionTree20kSampleMs": treeRun.medianMs,
+        "logisticRegression20kSampleMs": logisticRun.medianMs,
+        "kmeansK4_20kFitSampleMs": kmeansRun.medianMs,
+        "clusterCountScanK2to8Ms": scanRun.medianMs,
       },
+      modelRowsUsed: ridgeRun.result.rows.used,
       iterationsPerOperation: parsed.iterations,
       filteredRows: filtered.result.rows.length,
       chartGroups: aggregated.result.length,

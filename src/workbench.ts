@@ -4,10 +4,14 @@ export const MAX_IMPORT_COLUMNS = 100;
 export const MAX_CORRELATION_COLUMNS = 8;
 const MAX_CELL_LENGTH = 32_000;
 
+export type Delimiter = "," | ";" | "\t" | "|";
+
 export type DataTable = {
   sourceName: string;
   columns: string[];
   rows: string[][];
+  /** Delimiter the file was parsed with. Absent on tables built by joins/appends. */
+  delimiter?: Delimiter;
 };
 
 export type ColumnProfile = {
@@ -48,6 +52,84 @@ export type BaselineEvaluation = {
   metrics: Array<{ label: string; value: string }>;
 };
 
+const NUMBER_PATTERN = /^[+-]?(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?$/;
+
+/**
+ * Strict decimal parser. Unlike `Number()`, it rejects hex/binary/octal
+ * literals ("0x1A"), "Infinity", and out-of-range exponents, so identifiers and
+ * codes are never silently reinterpreted as numbers.
+ */
+export function parseNumber(text: string): number | null {
+  const trimmed = text.trim();
+  if (!NUMBER_PATTERN.test(trimmed)) return null;
+  const value = Number(trimmed);
+  return Number.isFinite(value) ? value : null;
+}
+
+const DELIMITER_CANDIDATES: Delimiter[] = [",", ";", "\t", "|"];
+const DELIMITER_SAMPLE_CHARS = 64 * 1024;
+const DELIMITER_SAMPLE_LINES = 20;
+
+/**
+ * Picks the delimiter whose count is consistent across the first lines
+ * (quote-aware). `.tsv` is always tab. Falls back to a comma, so malformed
+ * files still produce the same errors as before.
+ */
+export function detectDelimiter(
+  contents: string,
+  sourceName: string,
+): Delimiter {
+  if (sourceName.toLowerCase().endsWith(".tsv")) return "\t";
+  const sample = contents.slice(
+    contents.charCodeAt(0) === 0xfeff ? 1 : 0,
+    DELIMITER_SAMPLE_CHARS,
+  );
+  const lines: Array<Record<Delimiter, number>> = [];
+  let counts: Record<Delimiter, number> = emptyDelimiterCounts();
+  let quoted = false;
+  let hasContent = false;
+  for (let index = 0; index < sample.length; index += 1) {
+    const character = sample[index];
+    if (character === '"') {
+      quoted = !quoted;
+      hasContent = true;
+    } else if (!quoted && (character === "\n" || character === "\r")) {
+      if (character === "\r" && sample[index + 1] === "\n") index += 1;
+      if (hasContent) lines.push(counts);
+      counts = emptyDelimiterCounts();
+      hasContent = false;
+      if (lines.length >= DELIMITER_SAMPLE_LINES) break;
+    } else {
+      hasContent = true;
+      if (!quoted && (DELIMITER_CANDIDATES as string[]).includes(character))
+        counts[character as Delimiter] += 1;
+    }
+  }
+  if (hasContent && lines.length < DELIMITER_SAMPLE_LINES) lines.push(counts);
+  if (lines.length < 2) return ",";
+
+  let best: Delimiter = ",";
+  let bestScore = -1;
+  let bestHeaderCount = 0;
+  for (const candidate of DELIMITER_CANDIDATES) {
+    const headerCount = lines[0][candidate];
+    if (headerCount === 0) continue;
+    const consistent =
+      lines.filter((line) => line[candidate] === headerCount).length /
+      lines.length;
+    if (consistent < 0.8) continue;
+    if (
+      consistent > bestScore ||
+      (consistent === bestScore && headerCount > bestHeaderCount)
+    ) {
+      best = candidate;
+      bestScore = consistent;
+      bestHeaderCount = headerCount;
+    }
+  }
+  return best;
+}
+
 export function validateImportFile(
   file: Pick<File, "name" | "size" | "type">,
 ): string | null {
@@ -76,13 +158,14 @@ export function validateImportFile(
 export function parseDelimitedFile(
   contents: string,
   sourceName: string,
+  options: { delimiter?: Delimiter } = {},
 ): DataTable {
   if (contents.includes("\0"))
     throw new Error(
       "The file contains binary data and cannot be read as CSV or TSV.",
     );
 
-  const delimiter = sourceName.toLowerCase().endsWith(".tsv") ? "\t" : ",";
+  const delimiter = options.delimiter ?? detectDelimiter(contents, sourceName);
   const records: string[][] = [];
   let record: string[] = [];
   let field = "";
@@ -154,7 +237,7 @@ export function parseDelimitedFile(
     return row;
   });
 
-  return { sourceName, columns, rows };
+  return { sourceName, columns, rows, delimiter };
 }
 
 export function profileTable(table: DataTable): TableProfile {
@@ -165,19 +248,26 @@ export function profileTable(table: DataTable): TableProfile {
     const frequencies = new Map<string, number>();
     for (const value of present)
       frequencies.set(value, (frequencies.get(value) ?? 0) + 1);
-    const numbers = present.map(Number);
-    const numeric = present.length > 0 && numbers.every(Number.isFinite);
+    const parsed = present.map(parseNumber);
+    const numeric = present.length > 0 && parsed.every((value) => value !== null);
+    const numbers = numeric ? (parsed as number[]) : [];
+    let minimum = Infinity;
+    let maximum = -Infinity;
+    let total = 0;
+    for (const value of numbers) {
+      if (value < minimum) minimum = value;
+      if (value > maximum) maximum = value;
+      total += value;
+    }
 
     return {
       name,
       missing: values.length - present.length,
       unique: frequencies.size,
       numeric,
-      minimum: numeric ? Math.min(...numbers) : null,
-      maximum: numeric ? Math.max(...numbers) : null,
-      mean: numeric
-        ? numbers.reduce((sum, value) => sum + value, 0) / numbers.length
-        : null,
+      minimum: numeric ? minimum : null,
+      maximum: numeric ? maximum : null,
+      mean: numeric ? total / numbers.length : null,
       topValues: [...frequencies.entries()]
         .sort(
           (left, right) =>
@@ -205,7 +295,7 @@ export function filterRows(
   const index = table.columns.indexOf(column);
   if (index < 0)
     throw new Error("Choose a column that exists in the current dataset.");
-  const numericOperand = Number(operand);
+  const numericOperand = parseNumber(operand);
 
   const rows = table.rows.filter((row) => {
     const value = row[index] ?? "";
@@ -215,19 +305,9 @@ export function filterRows(
       case "contains":
         return value.toLocaleLowerCase().includes(operand.toLocaleLowerCase());
       case "greater":
-        return (
-          operand.trim() !== "" &&
-          value.trim() !== "" &&
-          Number.isFinite(Number(value)) &&
-          Number(value) > numericOperand
-        );
+        return compareNumeric(value, numericOperand, (left, right) => left > right);
       case "less":
-        return (
-          operand.trim() !== "" &&
-          value.trim() !== "" &&
-          Number.isFinite(Number(value)) &&
-          Number(value) < numericOperand
-        );
+        return compareNumeric(value, numericOperand, (left, right) => left < right);
       case "empty":
         return value.trim() === "";
       case "not-empty":
@@ -265,9 +345,9 @@ export function aggregateBy(
     if (aggregation === "count") {
       current.records += 1;
     } else {
-      const rawValue = row[valueIndex]?.trim() ?? "";
-      if (rawValue === "" || !Number.isFinite(Number(rawValue))) continue;
-      current.sum += Number(rawValue);
+      const parsedValue = parseNumber(row[valueIndex] ?? "");
+      if (parsedValue === null) continue;
+      current.sum += parsedValue;
       current.records += 1;
     }
     groups.set(group, current);
@@ -403,24 +483,31 @@ export function normalizeNumericColumn(
   if (index < 0)
     throw new Error("Choose a column that exists in the current dataset.");
   const values = table.rows.map((row) => row[index] ?? "");
-  const numbers = values.filter((value) => value.trim() !== "").map(Number);
-  if (numbers.length === 0 || !numbers.every(Number.isFinite)) {
+  const parsedValues = values
+    .filter((value) => value.trim() !== "")
+    .map(parseNumber);
+  if (parsedValues.length === 0 || parsedValues.some((value) => value === null)) {
     throw new Error(
       "Normalization requires at least one non-empty numeric value and no non-numeric values.",
     );
   }
+  const numbers = parsedValues as number[];
 
   const mean = numbers.reduce((sum, value) => sum + value, 0) / numbers.length;
   const deviation = Math.sqrt(
     numbers.reduce((sum, value) => sum + (value - mean) ** 2, 0) /
       numbers.length,
   );
-  const minimum = Math.min(...numbers);
-  const maximum = Math.max(...numbers);
+  let minimum = Infinity;
+  let maximum = -Infinity;
+  for (const value of numbers) {
+    if (value < minimum) minimum = value;
+    if (value > maximum) maximum = value;
+  }
   const rows = table.rows.map((row) =>
     row.map((value, columnIndex) => {
       if (columnIndex !== index || value.trim() === "") return value;
-      const number = Number(value);
+      const number = parseNumber(value) as number;
       const normalized =
         method === "min-max"
           ? maximum === minimum
@@ -459,8 +546,8 @@ export function correlationMatrix(
     table.rows.map((row) => {
       const text = row[columnIndex]?.trim() ?? "";
       if (text === "") return null;
-      const value = Number(text);
-      if (!Number.isFinite(value))
+      const value = parseNumber(text);
+      if (value === null)
         throw new Error(
           "Correlation requires numeric columns. Remove or handle non-numeric values first.",
         );
@@ -643,11 +730,12 @@ export function evaluateBaseline(
     );
 
   if (task === "regression") {
-    const numbers = values.map(Number);
-    if (!numbers.every(Number.isFinite))
+    const parsedTargets = values.map(parseNumber);
+    if (parsedTargets.some((value) => value === null))
       throw new Error(
         "Regression requires a numeric target column without non-numeric values.",
       );
+    const numbers = parsedTargets as number[];
     const prediction =
       numbers.slice(0, trainRows).reduce((sum, value) => sum + value, 0) /
       trainRows;
@@ -715,12 +803,48 @@ export function formatBytes(bytes: number): string {
   return `${(bytes / (1024 * 1024)).toFixed(0)} MiB`;
 }
 
-export function serializeCsv(table: DataTable): string {
+export type SerializeOptions = {
+  /**
+   * Prefix cells that a spreadsheet could execute as formulas (leading
+   * `=`, `+`, `-`, `@`, tab, or CR) with an apostrophe. Plain numbers such as
+   * "-5" are left alone. On by default; disable for byte-exact round trips.
+   */
+  neutralizeFormulas?: boolean;
+};
+
+export function serializeCsv(
+  table: DataTable,
+  options: SerializeOptions = {},
+): string {
+  const neutralize = options.neutralizeFormulas ?? true;
+  const cell = (value: string) => {
+    const safe =
+      neutralize && looksLikeFormula(value) ? `'${value}` : value;
+    return `"${safe.replaceAll('"', '""')}"`;
+  };
   return [table.columns, ...table.rows]
-    .map((row) =>
-      row.map((value) => `"${value.replaceAll('"', '""')}"`).join(","),
-    )
+    .map((row) => row.map(cell).join(","))
     .join("\r\n");
+}
+
+export function looksLikeFormula(value: string): boolean {
+  if (!/^[=+\-@\t\r]/.test(value)) return false;
+  if (value.length === 1 && (value === "-" || value === "+")) return false;
+  return parseNumber(value) === null;
+}
+
+function emptyDelimiterCounts(): Record<Delimiter, number> {
+  return { ",": 0, ";": 0, "\t": 0, "|": 0 };
+}
+
+function compareNumeric(
+  value: string,
+  operand: number | null,
+  test: (left: number, right: number) => boolean,
+): boolean {
+  if (operand === null) return false;
+  const parsed = parseNumber(value);
+  return parsed !== null && test(parsed, operand);
 }
 
 function pushField(record: string[], value: string): void {

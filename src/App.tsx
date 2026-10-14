@@ -1,4 +1,4 @@
-import { lazy, Suspense, useState, type ChangeEvent } from "react";
+import { lazy, Suspense, useMemo, useState, type ChangeEvent } from "react";
 import {
   Activity,
   ArrowDownToLine,
@@ -13,32 +13,45 @@ import {
   SlidersHorizontal,
   Sparkles,
   Table2,
+  Undo2,
   WandSparkles,
 } from "lucide-react";
+import { ClusterPanel } from "./ClusterPanel";
+import { ColumnDetail } from "./ColumnDetail";
 import { CorrelationPanel } from "./CorrelationPanel";
+import { HistoryPanel } from "./HistoryPanel";
 import { IntegrationPanel } from "./IntegrationPanel";
+import { ModelLab } from "./ModelLab";
+import { QualityPanel } from "./QualityPanel";
 import "./App.css";
+import "./Lab.css";
 import {
-  correlationMatrix,
-  dropDuplicateRows,
-  dropRowsWithMissingValues,
+  analyzeTable,
+  assessQuality,
+  correlate,
+  type CorrelationMethod,
+  type CorrelationResult,
+} from "./analytics.ts";
+import { downloadText } from "./download.ts";
+import {
+  applyStep,
+  exportRecipe,
+  parseRecipe,
+  replayRecipe,
+  type Step,
+} from "./recipe.ts";
+import {
   evaluateBaseline,
-  fillMissing,
-  filterRows,
   formatBytes,
   MAX_CORRELATION_COLUMNS,
   MAX_IMPORT_BYTES,
-  normalizeNumericColumn,
   parseDelimitedFile,
   profileTable,
-  removeColumn,
-  renameColumn,
   serializeCsv,
-  trimTextColumn,
   validateImportFile,
   type BaselineEvaluation,
-  type CorrelationMatrix,
   type DataTable,
+  type Delimiter,
   type FilterOperator,
 } from "./workbench";
 
@@ -68,7 +81,17 @@ type Transform =
   | "drop-missing"
   | "deduplicate"
   | "normalize-min-max"
-  | "normalize-z-score";
+  | "normalize-z-score"
+  | "impute-median"
+  | "impute-mean"
+  | "impute-mode"
+  | "standardize-missing"
+  | "convert-number"
+  | "harmonize"
+  | "outliers-cap"
+  | "outliers-remove"
+  | "one-hot"
+  | "date-parts";
 
 const views: Array<{ key: View; label: string; Icon: typeof LayoutDashboard }> =
   [
@@ -86,20 +109,99 @@ const operators: Array<{ value: FilterOperator; label: string }> = [
   { value: "not-empty", label: "is not empty" },
 ];
 
+const transformNotes: Partial<Record<Transform, string>> = {
+  "impute-median":
+    "Replaces empty cells with the column median (numeric columns only). The median is not pulled around by outliers.",
+  "impute-mean":
+    "Replaces empty cells with the column average (numeric columns only). Outliers pull the average, so the median is often safer.",
+  "impute-mode": "Replaces empty cells with the most common value in the column.",
+  "standardize-missing":
+    'Turns markers such as "N/A", "null", "none", "-" and "?" into empty cells so they count as missing. Check first that "none" or "na" are not real categories here.',
+  "convert-number":
+    "Reads currency symbols, thousands commas, brackets for negatives and % signs as plain numbers (12% becomes 0.12). Ambiguous values such as 1,5 are refused, and nothing changes unless every value converts.",
+  harmonize:
+    "Merges spellings that differ only by case or spacing (Paid, paid, PAID) into the most common form.",
+  "outliers-cap":
+    "Limits values outside 1.5 × IQR to the nearest boundary. Every row is kept.",
+  "one-hot":
+    "Replaces a category column with one 0/1 column per value (up to 20 categories), ready for models.",
+  "date-parts":
+    "Adds year, month, day and weekday columns from an ISO date (YYYY-MM-DD).",
+};
+
+function buildTransformStep(
+  transform: Transform,
+  column: string,
+  renameValue: string,
+  replacement: string,
+): Step {
+  switch (transform) {
+    case "rename":
+      return { op: "rename", column, to: renameValue };
+    case "fill":
+      return { op: "fill", column, value: replacement };
+    case "remove":
+      return { op: "remove-column", column };
+    case "trim":
+      return { op: "trim", column };
+    case "drop-missing":
+      return { op: "drop-missing", columns: [column] };
+    case "deduplicate":
+      return { op: "deduplicate" };
+    case "normalize-min-max":
+      return { op: "normalize", column, method: "min-max" };
+    case "normalize-z-score":
+      return { op: "normalize", column, method: "z-score" };
+    case "impute-median":
+      return { op: "impute", column, strategy: "median" };
+    case "impute-mean":
+      return { op: "impute", column, strategy: "mean" };
+    case "impute-mode":
+      return { op: "impute", column, strategy: "mode" };
+    case "standardize-missing":
+      return { op: "standardize-missing", column };
+    case "convert-number":
+      return { op: "convert-number", column };
+    case "harmonize":
+      return { op: "harmonize-categories", column };
+    case "outliers-cap":
+      return { op: "outliers", column, method: "cap", multiplier: 1.5 };
+    case "outliers-remove":
+      return { op: "outliers", column, method: "remove", multiplier: 1.5 };
+    case "one-hot":
+      return { op: "one-hot", column };
+    case "date-parts":
+      return { op: "date-parts", column };
+  }
+}
+
+function delimiterName(delimiter: Delimiter): string {
+  switch (delimiter) {
+    case ",":
+      return "comma";
+    case ";":
+      return "semicolon";
+    case "\t":
+      return "tab";
+    case "|":
+      return "pipe";
+  }
+}
+
 function App() {
   const [table, setTable] = useState<DataTable>(initialTable);
   const [source, setSource] = useState<DataTable>(initialTable);
   const [profile, setProfile] = useState(() => profileTable(initialTable));
   const [view, setView] = useState<View>("data");
   const [isSample, setIsSample] = useState(true);
-  const [modified, setModified] = useState(false);
+  const [steps, setSteps] = useState<Step[]>([]);
+  const [protectFormulas, setProtectFormulas] = useState(true);
   const [fileSize, setFileSize] = useState<number | null>(null);
   const [error, setError] = useState("");
   const [filterColumn, setFilterColumn] = useState(initialTable.columns[1]);
   const [filterOperator, setFilterOperator] =
     useState<FilterOperator>("equals");
   const [filterValue, setFilterValue] = useState("North");
-  const [filtered, setFiltered] = useState(false);
   const [column, setColumn] = useState(initialTable.columns[0]);
   const [transform, setTransform] = useState<Transform>("rename");
   const [renameValue, setRenameValue] = useState("");
@@ -109,9 +211,11 @@ function App() {
     "orders",
     "revenue",
   ]);
-  const [correlations, setCorrelations] = useState<CorrelationMatrix | null>(
+  const [correlations, setCorrelations] = useState<CorrelationResult | null>(
     null,
   );
+  const [correlationMethod, setCorrelationMethod] =
+    useState<CorrelationMethod>("pearson");
   const [correlationError, setCorrelationError] = useState("");
   const [task, setTask] = useState<"regression" | "classification">(
     "regression",
@@ -123,6 +227,18 @@ function App() {
     .replace(/\.(csv|tsv)/gi, "")
     .replaceAll("+", " + ");
   const missing = profile.columns.reduce((sum, item) => sum + item.missing, 0);
+  const modified = steps.length > 0;
+  const filtered = steps.some((step) => step.op === "filter");
+  const insight = useMemo(() => analyzeTable(table), [table]);
+  const insightByName = useMemo(
+    () => new Map(insight.columns.map((item) => [item.name, item])),
+    [insight],
+  );
+  const quality = useMemo(
+    () => assessQuality(table, insight),
+    [table, insight],
+  );
+  const selectedTransformNote = transformNotes[transform];
   const needsOperand =
     filterOperator === "empty" || filterOperator === "not-empty";
 
@@ -130,7 +246,6 @@ function App() {
     const nextProfile = profileTable(next);
     setTable(next);
     setProfile(nextProfile);
-    setModified(true);
     setEvaluation(null);
     setCorrelations(null);
     setCorrelationColumns((current) => {
@@ -171,9 +286,8 @@ function App() {
       setSource(imported);
       setProfile(importedProfile);
       setIsSample(false);
-      setModified(false);
+      setSteps([]);
       setFileSize(file.size);
-      setFiltered(false);
       setFilterColumn(imported.columns[0]);
       setColumn(imported.columns[0]);
       setTarget(imported.columns[imported.columns.length - 1]);
@@ -197,63 +311,84 @@ function App() {
     }
   }
 
-  function applyFilter() {
+  function commitStep(step: Step, failure = "The change could not be applied.") {
     try {
-      updateTable(filterRows(table, filterColumn, filterOperator, filterValue));
-      setFiltered(true);
+      updateTable(applyStep(table, step));
+      setSteps((current) => [...current, step]);
+      setError("");
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : failure);
+    }
+  }
+
+  function applyFilter() {
+    commitStep(
+      {
+        op: "filter",
+        column: filterColumn,
+        operator: filterOperator,
+        value: filterValue,
+      },
+      "The filter could not be applied.",
+    );
+  }
+
+  function applyTransform() {
+    commitStep(buildTransformStep(transform, column, renameValue, replacement));
+  }
+
+  function undoLastStep() {
+    const remaining = steps.slice(0, -1);
+    try {
+      updateTable(replayRecipe(source, remaining));
+      setSteps(remaining);
       setError("");
     } catch (cause) {
       setError(
-        cause instanceof Error
-          ? cause.message
-          : "The filter could not be applied.",
+        cause instanceof Error ? cause.message : "The step could not be undone.",
       );
     }
   }
 
-  function applyTransform() {
+  function saveRecipe() {
     try {
-      let next: DataTable;
-      switch (transform) {
-        case "rename":
-          next = renameColumn(table, column, renameValue);
-          break;
-        case "fill":
-          next = fillMissing(table, column, replacement);
-          break;
-        case "remove":
-          next = removeColumn(table, column);
-          break;
-        case "trim":
-          next = trimTextColumn(table, column);
-          break;
-        case "drop-missing":
-          next = dropRowsWithMissingValues(table, [column]);
-          break;
-        case "deduplicate":
-          next = dropDuplicateRows(table);
-          break;
-        case "normalize-min-max":
-          next = normalizeNumericColumn(table, column, "min-max");
-          break;
-        case "normalize-z-score":
-          next = normalizeNumericColumn(table, column, "z-score");
-          break;
-      }
-      updateTable(next);
+      downloadText(
+        `${datasetName || "dataset"}-recipe.json`,
+        exportRecipe(steps, source.sourceName),
+        "application/json;charset=utf-8",
+      );
+      setError("");
+    } catch (cause) {
+      setError(
+        cause instanceof Error ? cause.message : "The recipe could not be saved.",
+      );
+    }
+  }
+
+  async function applyRecipeFile(file: File) {
+    if (file.size > 1024 * 1024) {
+      setError("Recipe files must be smaller than 1 MB.");
+      return;
+    }
+    try {
+      const recipe = parseRecipe(await file.text());
+      updateTable(replayRecipe(table, recipe));
+      setSteps((current) => [...current, ...recipe]);
       setError("");
     } catch (cause) {
       setError(
         cause instanceof Error
           ? cause.message
-          : "The change could not be applied.",
+          : "The recipe could not be applied.",
       );
     }
   }
 
   function calculateCorrelations() {
     try {
-      setCorrelations(correlationMatrix(table, correlationColumns));
+      setCorrelations(
+        correlate(table, correlationColumns, correlationMethod),
+      );
       setCorrelationError("");
     } catch (cause) {
       setCorrelations(null);
@@ -268,8 +403,7 @@ function App() {
   function restoreSource() {
     setTable(source);
     setProfile(profileTable(source));
-    setModified(false);
-    setFiltered(false);
+    setSteps([]);
     setEvaluation(null);
     setCorrelations(null);
     setCorrelationError("");
@@ -280,7 +414,7 @@ function App() {
   }
 
   function exportCsv() {
-    const csv = serializeCsv(table);
+    const csv = serializeCsv(table, { neutralizeFormulas: protectFormulas });
     const url = URL.createObjectURL(
       new Blob([csv], { type: "text/csv;charset=utf-8" }),
     );
@@ -393,6 +527,15 @@ function App() {
               <button
                 className="button button-secondary"
                 type="button"
+                onClick={undoLastStep}
+                disabled={!modified}
+                title="Undo the last change"
+              >
+                <Undo2 size={15} /> Undo
+              </button>
+              <button
+                className="button button-secondary"
+                type="button"
                 onClick={restoreSource}
                 disabled={!modified}
                 title="Restore imported source"
@@ -407,6 +550,17 @@ function App() {
               >
                 <ArrowDownToLine size={16} /> Export CSV
               </button>
+              <label
+                className="protect-toggle"
+                title="Prefixes cells that start with = + - @ so spreadsheets cannot run them as formulas"
+              >
+                <input
+                  type="checkbox"
+                  checked={protectFormulas}
+                  onChange={(event) => setProtectFormulas(event.target.checked)}
+                />
+                Protect against spreadsheet formulas
+              </label>
             </div>
           </section>
           {error && (
@@ -522,6 +676,13 @@ function App() {
           </div>
 
           {view === "data" && (
+            <QualityPanel
+              report={quality}
+              rowCount={table.rows.length}
+              onApply={(step) => commitStep(step)}
+            />
+          )}
+          {view === "data" && (
             <div className="overview-layout">
               <section className="section-panel table-section">
                 <div className="section-heading">
@@ -583,7 +744,12 @@ function App() {
                   </div>
                 )}
                 <div className="table-footer">
-                  <span>Delimited text · UTF-8</span>
+                  <span>
+                    Delimited text · UTF-8
+                    {source.delimiter
+                      ? ` · ${delimiterName(source.delimiter)}-separated`
+                      : ""}
+                  </span>
                   <span>Preview limited to 8 rows</span>
                 </div>
               </section>
@@ -601,7 +767,12 @@ function App() {
                   <div className="profile-row" key={item.name}>
                     <div>
                       <b>{item.name}</b>
-                      <small>{item.numeric ? "NUMERIC" : "TEXT"}</small>
+                      <small>
+                        {(
+                          insightByName.get(item.name)?.type ??
+                          (item.numeric ? "numeric" : "text")
+                        ).toUpperCase()}
+                      </small>
                     </div>
                     <p>
                       {item.unique} unique <span>{item.missing} missing</span>
@@ -634,6 +805,7 @@ function App() {
                         </>
                       )}
                     </p>
+                    <ColumnDetail insight={insightByName.get(item.name)} />
                   </div>
                 ))}
                 <div className="profile-foot">
@@ -649,6 +821,12 @@ function App() {
                 .map((item) => item.name)}
               selectedColumns={correlationColumns}
               matrix={correlations}
+              method={correlationMethod}
+              onMethodChange={(method) => {
+                setCorrelationMethod(method);
+                setCorrelations(null);
+                setCorrelationError("");
+              }}
               error={correlationError}
               maxColumns={MAX_CORRELATION_COLUMNS}
               onSelectionChange={(columns) => {
@@ -684,18 +862,48 @@ function App() {
                         setTransform(event.target.value as Transform)
                       }
                     >
-                      <option value="rename">Rename a column</option>
-                      <option value="fill">Fill missing values</option>
-                      <option value="trim">Trim text whitespace</option>
-                      <option value="drop-missing">Remove missing rows</option>
-                      <option value="deduplicate">Remove duplicate rows</option>
-                      <option value="normalize-min-max">
-                        Normalize to 0–1
-                      </option>
-                      <option value="normalize-z-score">
-                        Standardize (z-score)
-                      </option>
-                      <option value="remove">Remove a column</option>
+                      <optgroup label="Clean">
+                        <option value="fill">Fill missing with a value</option>
+                        <option value="impute-median">
+                          Fill missing with the median
+                        </option>
+                        <option value="impute-mean">
+                          Fill missing with the mean
+                        </option>
+                        <option value="impute-mode">
+                          Fill missing with the most common
+                        </option>
+                        <option value="standardize-missing">
+                          Mark “N/A” markers as missing
+                        </option>
+                        <option value="convert-number">
+                          Convert text to numbers ($, %, commas)
+                        </option>
+                        <option value="harmonize">Merge spelling variants</option>
+                        <option value="trim">Trim text whitespace</option>
+                        <option value="outliers-cap">Cap outliers</option>
+                        <option value="outliers-remove">
+                          Remove outlier rows
+                        </option>
+                        <option value="drop-missing">Remove missing rows</option>
+                        <option value="deduplicate">Remove duplicate rows</option>
+                      </optgroup>
+                      <optgroup label="Prepare for modeling">
+                        <option value="normalize-min-max">
+                          Normalize to 0–1
+                        </option>
+                        <option value="normalize-z-score">
+                          Standardize (z-score)
+                        </option>
+                        <option value="one-hot">One-hot encode a category</option>
+                        <option value="date-parts">
+                          Extract date parts
+                        </option>
+                      </optgroup>
+                      <optgroup label="Structure">
+                        <option value="rename">Rename a column</option>
+                        <option value="remove">Remove a column</option>
+                      </optgroup>
                     </select>
                   </label>
                   {transform !== "deduplicate" && (
@@ -756,6 +964,15 @@ function App() {
                     to undo all changes.
                   </p>
                 )}
+                {selectedTransformNote && (
+                  <p className="prepare-note">{selectedTransformNote}</p>
+                )}
+                {transform === "outliers-remove" && (
+                  <p className="warning-note">
+                    Rows with values outside 1.5 × IQR will be removed. Real
+                    extreme values are lost, so inspect them first.
+                  </p>
+                )}
                 <div className="tool-actions">
                   <button
                     className="button button-dark"
@@ -770,8 +987,11 @@ function App() {
                 key={`${table.sourceName}:${table.columns.join("|")}`}
                 table={table}
                 onApply={(integrated) => {
-                  updateTable(integrated);
-                  setFiltered(false);
+                  commitStep({
+                    op: "replace-table",
+                    table: integrated,
+                    label: `Combine with another file (${integrated.rows.length.toLocaleString()} rows, ${integrated.columns.length} columns)`,
+                  });
                   setIsSample(false);
                   setFileSize(null);
                 }}
@@ -841,6 +1061,12 @@ function App() {
                   </span>
                 </div>
               </section>
+              <HistoryPanel
+                steps={steps}
+                onUndo={undoLastStep}
+                onExport={saveRecipe}
+                onImport={(file) => void applyRecipeFile(file)}
+              />
               <div className="prepare-footer">
                 <RotateCcw size={16} />
                 <span>
@@ -862,10 +1088,21 @@ function App() {
 
           {view === "evaluate" && (
             <div className="evaluate-layout">
+              <ModelLab
+                table={table}
+                insight={insight}
+                datasetName={datasetName}
+                defaultTarget={target}
+              />
+              <ClusterPanel
+                table={table}
+                insight={insight}
+                onAdd={(step) => commitStep(step)}
+              />
               <section className="section-panel tool-section">
                 <div className="section-heading">
                   <div>
-                    <p className="eyebrow">BASELINE CHECK</p>
+                    <p className="eyebrow">QUICK BASELINE</p>
                     <h2>
                       <BarChart3 size={18} /> Evaluate a simple baseline
                     </h2>
@@ -876,7 +1113,8 @@ function App() {
                 </div>
                 <p>
                   A mean-value or majority-class baseline with an ordered 80/20
-                  split. This is a diagnostic, not a trained model.
+                  split. This is a diagnostic, not a trained model. Use the
+                  Model lab above for a shuffled, seeded test of a real model.
                 </p>
                 <div className="form-grid evaluation-form">
                   <label>

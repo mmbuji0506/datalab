@@ -8,8 +8,9 @@
     "build": "tsc -b && vite build",
     "lint": "oxlint",
     "preview": "vite preview",
-    "test": "node --experimental-strip-types --test tests/workbench.test.mjs",
-    "benchmark": "node --experimental-strip-types tests/benchmark.mjs"
+    "test": "node --experimental-strip-types --test tests/workbench.test.mjs tests/core-fixes.test.mjs tests/analytics.test.mjs tests/models.test.mjs tests/clustering.test.mjs tests/recipe.test.mjs tests/journey.test.mjs tests/ui-smoke.test.mjs",
+    "benchmark": "node --experimental-strip-types tests/benchmark.mjs",
+    "journey": "node --experimental-strip-types --no-warnings tests/journey-demo.mjs"
   },
   "dependencies": {
     "lucide-react": "^1.55.0",
@@ -24,6 +25,6 @@
     "@vitejs/plugin-react": "^6.1.1",
     "oxlint": "^1.81.0",
     "typescript": "~6.0.2",
-    "vite": "^8.3.0"
+    "vite": "^8.3.4"
   }
 }
